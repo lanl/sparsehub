@@ -1,0 +1,9 @@
+#ifndef CONFIG_HPP
+#define CONFIG_HPP
+
+#cmakedefine ENABLE_FP_EXCEPTIONS
+
+// make production build happy
+#define UNUSED(x) ((void)(x))
+
+#endif // CONFIG_HPP

@@ -24,15 +24,16 @@ You can use different sparse data represenations us=ing the '-l' command line ar
 will run the problem using compressed row storage.
 
 ## Command Line Arguments
-./sparsehub -h
 
-help: sparsehub [-h] [-l LAYOUT] [FILENAME]
+    ./sparsehub -h
 
-Sparsehub solves the advection equation using a sparse matrix representation of the data.
+    help: sparsehub [-h] [-l LAYOUT] [FILENAME]
 
-Options:
- -h              Display this help message.
-  -l LAYOUT       Specify the sparse layout type [0=dense (default), 1=fixed bandwith, 2=compressed row].
+    Sparsehub solves the advection equation using a sparse matrix representation of the data.
 
-  Arguments:
-   FILENAME        The input file name.
+    Options:
+      -h              Display this help message.
+      -l LAYOUT       Specify the sparse layout type [0=dense (default), 1=fixed bandwith, 2=compressed row].
+
+    Arguments:
+      FILENAME        The input file name.

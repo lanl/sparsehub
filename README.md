@@ -21,7 +21,7 @@ You can use different sparse data represenations us=ing the '-l' command line ar
 
     ./sparsehub ../examples/input.inp -l 2
 
-will run the problem using compressed row storage.
+will run the problem using compressed row storage.  Currently, dense (0), fixed-bandwith (1), and compressed row (2) storage is available.
 
 ## Command Line Arguments
 

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iomanip>
 #include <iterator>
@@ -32,34 +33,6 @@ constexpr auto digits = std::numeric_limits<double>::digits10;
 
 constexpr int sigfigs = digits;
 constexpr int width = digits + 7;
-
-////////////////////////////////////////////////////////////////////////////////
-/// Soution struct
-////////////////////////////////////////////////////////////////////////////////
-struct solution_t {
-  double coef[3] = {0, 0, 0};
-  double val = 0;
-
-  solution_t & operator=(const solution_t & other)
-  {
-    if (this != &other) {
-      val = other.val;
-      coef[0] = other.coef[0];
-      coef[1] = other.coef[1];
-      coef[2] = other.coef[2];
-    }
-    return *this;
-  }
-
-  static void zero(const solution_t & in, solution_t & out)
-  {
-    out.coef[0] = in.coef[0];
-    out.coef[1] = in.coef[1];
-    out.coef[2] = in.coef[2];
-    out.val = 0;
-  }
-
-};
 
 ////////////////////////////////////////////////////////////////////////////////
 /// Boundary struct
@@ -447,7 +420,7 @@ void output_vtk(
     const char * prefix,
     const std::vector<double> & node_coords,
     const crs_t<index_t, index_t> & cell2vertices,
-    const std::vector<solution_t> & cell_solution)
+    const std::vector<double> & cell_solution)
 {
   std::string filename(prefix);
   filename += ".vtk";
@@ -489,14 +462,9 @@ void output_vtk(
   file << "SCALARS solution double 1" << std::endl;
   file << "LOOKUP_TABLE default" << std::endl;
   for (size_t c=0; c<ncells; ++c) 
-    file << cell_solution[c].val << " ";
+    file << cell_solution[c] << " ";
   file << std::endl;
   
-  file << "VECTORS coefficient double" << std::endl;
-  for (size_t c=0; c<ncells; ++c) {
-    const auto & coef = cell_solution[c].coef;
-    file << coef[0] << " " << coef[1] << " " << coef[2] << std::endl;
-  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -505,7 +473,7 @@ void output_vtk(
 void output_csv(
     const char * prefix,
     const std::vector<double> & cell_centroids,
-    const std::vector<solution_t> & cell_solution)
+    const std::vector<double> & cell_solution)
 {
   std::string filename(prefix);
   filename += ".csv";
@@ -522,11 +490,6 @@ void output_csv(
     ss << "x" << d;
     file << std::setw(width) << ss.str() << ",";
   }
-  for (size_t d=0; d<ndims; ++d) {
-    std::stringstream ss;
-    ss << "coefficient" << d;
-    file << std::setw(width) << ss.str() << ",";
-  }
   file << std::setw(width) << "solution" << std::endl; 
 
   for (size_t c=0; c<ncells; ++c) {
@@ -537,9 +500,7 @@ void output_csv(
     }
 
     const auto & u = cell_solution[c];
-    for (size_t d=0; d<ndims; ++d)
-      file << std::setw(width) << u.coef[d] << ",";
-    file << std::setw(width) << u.val << std::endl;
+    file << std::setw(width) << u << std::endl;
   }
 }
 
@@ -555,7 +516,8 @@ double time_step(
     const double * face_areas,
     const double * face_normals,
     const double * cell_volumes,
-    const solution_t * cell_solution)
+    const double * cell_solution,
+    const double * coef)
 {
   double dt = 0;
   
@@ -571,9 +533,8 @@ double time_step(
       const auto n = &face_normals[f*ndims];
 
       for (int m=0; m<my_mats; ++m) {
-        auto matpos = layout(c, m);
-        
-        const auto a = &cell_solution[matpos].coef[0];
+        auto mat = layout.column(c, m);
+        const auto a = &coef[mat*ndims];
 
         double dot = 0;
         for (size_t d=0; d<ndims; ++d)
@@ -594,21 +555,19 @@ double time_step(
 /// Compute flux
 ////////////////////////////////////////////////////////////////////////////////
 double flux(
-    const solution_t & ul,
-    const solution_t & ur,
+    const double ul,
+    const double ur,
+    const double * coef,
     const double * n,
     size_t ndims)
 {
-  const auto al = &ul.coef[0];
-  const auto ar = &ur.coef[0];
-
   // dot product
   double dot = 0;
   for (size_t d=0; d<ndims; ++d)
-    dot += 0.5 * (al[d] + ar[d]) * n[d];
+    dot += coef[d] * n[d];
 
   // upwind
-  double u = dot > 0 ? ul.val : ur.val;
+  double u = dot > 0 ? ul : ur;
 
   return u*dot;
 }
@@ -622,12 +581,13 @@ double material_flux(
     const layout_t & layout,
     const index_t ileft,
     const index_t iright,
-    const solution_t * cell_solution,
+    const double * coef,
+    const double * cell_solution,
     const double * n,
-    solution_t & ul,
-    solution_t & ur,
     bool & exists)
 {
+  double ul;
+  double ur;
 
   auto ml = layout.find_column(ileft,  m);
   auto mr = layout.find_column(iright, m);
@@ -640,16 +600,16 @@ double material_flux(
   if (has_right) {
     auto posr = layout(iright, mr);
     ur = cell_solution[posr];
-    if (has_left) solution_t::zero(ur, ul);
+    if (has_left) ul = 0;
   }
 
   if (has_left) {
     auto posl = layout(ileft, ml);
     ul = cell_solution[posl];
-    if (has_right) solution_t::zero(ul, ur);
+    if (has_right) ur = 0;
   }
 
-  return flux(ul, ur, n, ndims);
+  return flux(ul, ur, &coef[m*ndims], n, ndims);
 }
     
 ////////////////////////////////////////////////////////////////////////////////
@@ -666,11 +626,11 @@ void residual(
     const boundary_t * bnd_faces,
     const double * face_normals,
     const double * face_areas,
-    const solution_t * cell_solution,
+    const double * coef,
+    const double * cell_solution,
     double * cell_residual)
 {
 
-  solution_t ul, ur;
   bool exists;
 
   for (size_t f=0; f<nfaces; ++f) {
@@ -690,8 +650,7 @@ void residual(
         auto flx = material_flux(
             m, ndims, layout,
             ileft, iright,
-            cell_solution, n,
-            ul, ur,
+            coef, cell_solution, n,
             exists);
         
         if (exists) {
@@ -717,8 +676,7 @@ void residual(
       auto flx = material_flux(
           m, ndims, layout,
           ileft, f.ghost,
-          cell_solution, n,
-          ul, ur,
+          coef, cell_solution, n,
           exists);
       if (exists)
         cell_residual[ileft *num_mats + m] -= flx*a;
@@ -737,7 +695,7 @@ void update(
     double dt,
     const layout_t & layout,
     const double * cell_volumes,
-    const solution_t * cell_solution,
+    const double * cell_solution,
     double * cell_residual)
 {
   for (size_t c=0; c<ncells; ++c) {
@@ -751,7 +709,7 @@ void update(
     for (int m=0; m<my_mats; ++m) {
       auto mat = layout.column(c, m);
       auto matpos = layout(c,m);
-      cell_residual[c*nmats+mat] += cell_solution[matpos].val;
+      cell_residual[c*nmats+mat] += cell_solution[matpos];
     }
 
   }
@@ -765,7 +723,7 @@ void to_sparse(
     size_t nmats,
     const layout_t & layout,
     const double * dense,
-    solution_t * sparse)
+    double * sparse)
 {
   for (size_t c=0; c<ncells; ++c) {
 
@@ -774,7 +732,7 @@ void to_sparse(
     for (int m=0; m<my_mats; ++m) {
       auto mat = layout.column(c, m);
       auto matpos = c*nmats + mat;
-      sparse[start+m].val = dense[matpos];
+      sparse[start+m] = dense[matpos];
     }
 
   } // cells
@@ -787,7 +745,7 @@ void to_dense(
     size_t ncells,
     size_t nmats,
     const layout_t & layout,
-    const solution_t * sparse,
+    const double * sparse,
     double * dense)
 {
   for (size_t c=0; c<ncells; ++c) {
@@ -797,7 +755,7 @@ void to_dense(
     for (int m=0; m<my_mats; ++m) {
       auto mat = layout.column(c, m);
       auto matpos = c*nmats + mat;
-      dense[matpos] = sparse[start+m].val;
+      dense[matpos] = sparse[start+m];
     }
 
   } // cells
@@ -1088,7 +1046,7 @@ int main(int argc, char ** argv) {
   
   auto prefix = as_scalar<std::string>(input_map, "prefix", "out");
 
-  auto num_mats = as_scalar<int>(input_map, "materials", 2);
+  auto num_mats = as_scalar<int>(input_map, "materials", 1);
   auto tol = as_scalar<double>(input_map, "tolerance", 1e-6);
 
   auto sparse_layout = layout_t(layout);
@@ -1275,28 +1233,24 @@ int main(int argc, char ** argv) {
   std::cout << "Initialize solution." << std::endl;
 
   std::vector<std::vector<int>> matids(num_cells);
-  std::vector<std::vector<solution_t>> initial_solution(num_cells);
+  std::vector<std::vector<double>> initial_solution(num_cells);
 
   std::vector<int> cell_num_mats(num_cells, 0);
   std::vector<char> cell_mat_active(num_cells*num_mats, 0);
 
-  auto ics = [&](const auto x, auto & u) {
-    u.coef[0] = coef[0];
-    u.coef[1] = coef[1];
-    u.coef[2] = coef[2];
-    auto fact =
-      mult[0]*sqr(x[0]-center[0]) +
-      mult[1]*sqr(x[1]-center[1]) +
-      mult[2]*sqr(x[2]-center[2]);
-    u.val = exp( - fact * alpha );
+  auto ics = [&](const auto m, const auto x, auto & u) {
+    double fact = 0;
+    for (size_t d=0; d<num_dims; ++d)
+      fact += mult[d]*sqr(x[d]-center[m*num_dims + d]);
+    u = exp( - fact * alpha );
   };
 
   for (int m=0; m<num_mats; ++m) {
 
     for (size_t c=0; c<num_cells; ++c) {
-      solution_t sol;
-      ics(&cell_centroids[c*num_dims], sol);
-      if (sol.val > tol) {
+      double sol;
+      ics(m, &cell_centroids[c*num_dims], sol);
+      if (sol > tol) {
         matids[c].emplace_back(m);
         initial_solution[c].emplace_back(sol);
         cell_num_mats[c]++;
@@ -1317,7 +1271,7 @@ int main(int argc, char ** argv) {
       mat_counts,
       mat_indices);
 
-  std::vector<solution_t> cell_solution;
+  std::vector<double> cell_solution;
   sparse_layout.compress(matids, initial_solution,  cell_solution);
   
 
@@ -1327,15 +1281,29 @@ int main(int argc, char ** argv) {
   double time=0;
 
   size_t output_counter = 0;
-  auto do_output = output_freq > 0;
   auto has_cfl = cfl > 0;
   
-  if (do_output) {
-    std::stringstream ss;
-    ss << prefix << zero_padded(output_counter++);
-    std::cout << "Outputing: " << ss.str() << std::endl;
-    output_vtk(ss.str().c_str(), node_coords, cell2verts, cell_solution);
-    output_csv(ss.str().c_str(), cell_centroids, cell_solution);
+  std::function<void(void)> do_output;
+
+  if (output_freq > 0) {
+    do_output = [&]() {
+      std::stringstream ss;
+      ss << prefix << zero_padded(output_counter++);
+      auto eff = static_cast<double>(cell_solution.size()) / (num_mats*num_cells);
+      std::cout << "Outputing: " << ss.str() << ", Efficiency=" << eff*100.;
+      std::cout << " %" <<  std::endl;
+      std::vector<double> dense_solution(num_mats*num_cells, 0);
+      to_dense(
+          num_cells,
+          num_mats,
+          sparse_layout,
+          cell_solution.data(),
+          dense_solution.data());
+      output_vtk(ss.str().c_str(), node_coords, cell2verts, dense_solution);
+      output_csv(ss.str().c_str(), cell_centroids, dense_solution);
+    };
+
+    do_output();
   }
   
   //============================================================================
@@ -1366,7 +1334,8 @@ int main(int argc, char ** argv) {
           face_areas.data(),
           face_normals.data(),
           cell_volumes.data(),
-          cell_solution.data());
+          cell_solution.data(),
+          coef.data());
       step_size *= cfl;
     }
 
@@ -1389,6 +1358,7 @@ int main(int argc, char ** argv) {
           bnd_faces.data(),
           face_normals.data(),
           face_areas.data(),
+          coef.data(),
           cell_solution.data(),
           cell_residual.data());
       
@@ -1449,13 +1419,8 @@ int main(int argc, char ** argv) {
     std::cout.unsetf( std::ios::scientific );
     std::cout.precision(ss);
   
-    //if (do_output && iter % output_freq == 0) {
-    //  std::stringstream ss;
-    //  ss << prefix << zero_padded(output_counter++);
-    //  std::cout << "Outputing: " << ss.str() << std::endl;
-    //  output_vtk(ss.str().c_str(), node_coords, cell2verts, cell_solution);
-    //  output_csv(ss.str().c_str(), cell_centroids, cell_solution);
-    //}
+    if (do_output && iter % output_freq == 0) 
+      do_output();
 
   }
 

@@ -1,8 +1,6 @@
 #ifndef SPARSE_LAYOUT_HPP
 #define SPARSE_LAYOUT_HPP
 
-#include "config.hpp"
-
 #include <cassert>
 #include <iostream>
 #include <numeric>
@@ -18,49 +16,210 @@ enum class sparse_layout_type_t {
 ////////////////////////////////////////////////////////////////////////////////
 /// Spars layout data structure
 ////////////////////////////////////////////////////////////////////////////////
+template<typename ROW_INDEX, typename COL_INDEX>
 struct sparse_layout_t {
+
+  using row_t = ROW_INDEX;
+  using col_t = COL_INDEX;
 
   size_t num_rows = 0;
   size_t num_columns = 0;
   size_t bandwidth = 0;
   sparse_layout_type_t type = sparse_layout_type_t::dense;
-  int_t * row_offsets = nullptr;
-  int_t * row_counts = nullptr;
-  int_t * col_ids = nullptr;
+  row_t * row_offsets = nullptr;
+  col_t * row_counts = nullptr;
+  col_t * col_ids = nullptr;
 
   sparse_layout_t() = default;
+  sparse_layout_t(int ty) : type(static_cast<sparse_layout_type_t>(ty)) {}
   sparse_layout_t(sparse_layout_type_t ty) : type(ty) {}
   
-  /// Setup sparse representation
+  //============================================================================
+  /// Setup a sparse layout
+  //============================================================================
   void setup(
-      int_t ncols,
-      const std::vector<std::vector<int_t>> & ids,
-      std::vector<int_t> & off,
-      std::vector<int_t> & cnts,
-      std::vector<int_t> & ind,
-      int_t padding = 0);
+      size_t ncols,
+      const std::vector<std::vector<col_t>> & ids,
+      std::vector<row_t> & off,
+      std::vector<col_t> & cnts,
+      std::vector<col_t> & ind,
+      col_t padding = 0)
+  {
+    num_columns = ncols;
+    bandwidth = 0;
+    row_offsets = nullptr;
+    row_counts = nullptr;
+    col_ids = nullptr;
+      
+    num_rows = ids.size();
   
+    off.clear();
+    cnts.clear();
+    ind.clear();
+      
+    num_columns += padding;
+      
+    // max bandwidth
+    for (const auto & row : ids)
+      bandwidth = std::max<col_t>(row.size(), bandwidth);
+  
+    bandwidth += padding;
+  
+  
+    //----------------------------------
+    // Itpack
+    if (type == sparse_layout_type_t::itpack) {
+  
+      cnts.reserve(num_rows);
+      ind.reserve(bandwidth*num_rows);
+  
+      for (const auto & row : ids) {
+        auto n = row.size();
+        for (size_t j=0; j<n; ++j)
+          ind.emplace_back(row[j]);
+        for (size_t j=n; j<bandwidth; ++j)
+          ind.emplace_back(-1);
+        cnts.emplace_back(n);
+      }
+  
+      col_ids = ind.data();
+      row_counts = cnts.data();
+  
+    }
+    //----------------------------------
+    // crs
+    else if (type == sparse_layout_type_t::crs) {
+  
+      // count entries
+      size_t len = num_rows * padding;
+      for (const auto & row : ids)
+        len += row.size();
+  
+      // resize
+      ind.reserve(len);
+      off.reserve(num_rows + 1);
+      cnts.reserve(num_rows);
+  
+      // fill
+      off.emplace_back(0);
+      for (const auto & row : ids) {
+        auto n = row.size();
+        for (size_t j=0; j<n; ++j)
+          ind.emplace_back(row[j]);
+        for (col_t j=0; j<padding; ++j)
+          ind.emplace_back(-1);
+        cnts.emplace_back(n);
+        off.emplace_back(ind.size());
+      }
+  
+      col_ids = ind.data();
+      row_offsets = off.data();
+      row_counts = cnts.data();
+  
+    }
+  
+  } // make
+  
+  
+  //============================================================================
   /// Re-Setup sparse representation
-  void reconfigure(
+  //============================================================================
+  void expand(
       size_t tot_cols,
       size_t max_bandwidth,
-      const std::vector<int_t> & ncols,
-      std::vector<int_t> & off,
-      std::vector<int_t> & cnts,
-      std::vector<int_t> & ind);
+      const std::vector<col_t> & ncols,
+      std::vector<row_t> & off,
+      std::vector<col_t> & cnts,
+      std::vector<col_t> & ind)
+  {
+    //----------------------------------
+    // Itpack
+    if (type == sparse_layout_type_t::itpack) {
+      resize(tot_cols, max_bandwidth, ncols, ind, -1);
+  
+      for (size_t i=0; i<num_rows; ++i)
+        cnts[i] = ncols[i];
+  
+      row_counts = cnts.data();
+      col_ids = ind.data();
+    }
+    //----------------------------------
+    // crs
+    else if (type == sparse_layout_type_t::crs) {
+  
+      resize(tot_cols, max_bandwidth, ncols, ind, -1);
+      
+      for (size_t i=0; i<num_rows; ++i) {
+        auto n = ncols[i];
+        cnts[i] = n;
+        off[i+1] = off[i] + ncols[i];
+      }
+      
+      row_offsets = off.data();
+      row_counts = cnts.data();
+      col_ids = ind.data();
+    }
+    
+    // set some general stuff
+    num_columns = tot_cols;
+    bandwidth = max_bandwidth;
+  
+  
+  }
 
+  //============================================================================
   /// Re-Setup sparse representation
-  void reconfigure(std::vector<char> & active);
+  //============================================================================
+  void reconfigure(std::vector<char> & active)
+  {
+  
+    auto tot_cols = active.size() / num_rows;
+    col_t num_cols = num_columns;
+  
+    //----------------------------------
+    // Itpack
+    if (type == sparse_layout_type_t::itpack) {
+  
+      for (size_t i=0; i<num_rows; ++i) {
+        auto start = bandwidth*i;
+        size_t cnt = 0;
+        for (col_t j=0; j<num_cols; ++j) {
+          if (active[i*tot_cols + j]) {
+            assert(cnt<bandwidth && "itpack out of bounds");
+            col_ids[start + cnt] = j;
+            cnt++;
+          }
+        }
+      }
+  
+    }
+    //----------------------------------
+    // crs
+    else if (type == sparse_layout_type_t::crs) {
+      
+      for (size_t i=0; i<num_rows; ++i) {
+        auto start = row_offsets[i];
+        row_t cnt = 0;
+        for (col_t j=0; j<num_cols; ++j) {
+          if (active[i*tot_cols + j]) {
+            assert(cnt<row_offsets[i+1]-row_offsets[i] && "crs out of bounds");
+            col_ids[start + cnt] = j;
+            cnt++;
+          }
+        }
+      }
+  
+    }
+  
+  }
 
-  /// Reconfigure pointers
-  void reconfig(int_t * off, int_t * cnts, int_t * ind);
- 
-  //////////////////////////////////////////////////////////////////////////////
+
+  //============================================================================
   /// Compress a vector of vectors
-  //////////////////////////////////////////////////////////////////////////////
-  template<typename T, typename U>
+  //============================================================================
+  template<typename T>
   void compress(
-      std::vector<std::vector<U>> & ids,
+      std::vector<std::vector<col_t>> & ids,
       std::vector<std::vector<T>> & vals,
       std::vector<T> & nonzeros,
       T zero_val = T())
@@ -130,10 +289,10 @@ struct sparse_layout_t {
 
   } // make
 
-  //////////////////////////////////////////////////////////////////////////////
+  //============================================================================
   /// Accessors
-  //////////////////////////////////////////////////////////////////////////////
-  int_t row_size(int_t i) const {
+  //============================================================================
+  col_t row_size(row_t i) const {
     switch (type) {
       case (sparse_layout_type_t::crs):
         return row_counts[i];
@@ -144,7 +303,7 @@ struct sparse_layout_t {
     };
   }
   
-  int_t operator()(int_t i, int_t j) const {
+  size_t operator()(row_t i, col_t j) const {
     switch (type) {
       case (sparse_layout_type_t::crs):
         return row_offsets[i] + j;
@@ -155,7 +314,7 @@ struct sparse_layout_t {
     }
   }
 
-  int_t column(int_t i, int_t j) const {
+  col_t column(row_t i, col_t j) const {
     switch (type) {
       case (sparse_layout_type_t::crs):
         return col_ids[row_offsets[i] + j];
@@ -166,7 +325,7 @@ struct sparse_layout_t {
     }
   }
 
-  int_t find_column(int_t i, int_t ind) const
+  col_t find_column(row_t i, col_t ind) const
   {
     switch (type) {
       case (sparse_layout_type_t::crs): {
@@ -185,7 +344,7 @@ struct sparse_layout_t {
         return -1;
       }
       default:
-        return ind<static_cast<int_t>(num_columns) ? ind : -1;
+        return ind<static_cast<col_t>(num_columns) ? ind : -1;
     }
   }
 
@@ -218,21 +377,51 @@ struct sparse_layout_t {
 
   bool is_resizeable() const { return type != sparse_layout_type_t::dense; }
 
+  //============================================================================
   /// Check if a resize is needed
+  //============================================================================
   bool needs_resize(
       size_t tot_cols,
       size_t max_bandwidth,
-      const std::vector<int_t> & ncols,
-      bool shrink = false) const;
+      const std::vector<col_t> & ncols,
+      bool shrink = false) const
+  {
+    //--- dense storage
+    if (type == sparse_layout_type_t::dense) {
+      return shrink ? tot_cols!=num_columns : tot_cols>num_columns;
+    }
+    //--- max bandwidth
+    else if (type == sparse_layout_type_t::itpack) {
+        return shrink ? max_bandwidth!=bandwidth : max_bandwidth>bandwidth;
+    }
+    //--- compressed row
+    else if (type == sparse_layout_type_t::crs) {
+      if (shrink) {
+        for (size_t i=0; i<num_rows; ++i)
+          if (ncols[i]!=row_counts[i])
+            return true;
+      }
+      else {
+        for (size_t i=0; i<num_rows; ++i) {
+          col_t sz = row_offsets[i+1] - row_offsets[i];
+          if (ncols[i] > sz)
+            return true;
+        }
+      }
+    }
+    //--- no resize needed
+    return false;
+  }
 
-  //////////////////////////////////////////////////////////////////////////////
+
+  //============================================================================
   /// Blindly resize an array without checking if needed
-  //////////////////////////////////////////////////////////////////////////////
+  //============================================================================
   template<typename T>
   void resize(
       size_t num_mats,
       size_t max_mats,
-      const std::vector<int_t> & ncols,
+      const std::vector<col_t> & ncols,
       std::vector<T> & nonzeros,
       T zero_val = T()) const
   {
@@ -276,8 +465,8 @@ struct sparse_layout_t {
         auto old_start = row_offsets[i];
         auto nold = row_counts[i];
         auto nnew = ncols[i];
-        auto nmid = std::min<int_t>(nold, nnew);
-        for (int_t j=0; j<nmid; ++j) {
+        auto nmid = std::min<col_t>(nold, nnew);
+        for (col_t j=0; j<nmid; ++j) {
           auto new_off = (new_start + j) * nvals;
           auto old_off = (old_start + j) * nvals;
           for (size_t k=0; k<nvals; ++k)
@@ -296,63 +485,9 @@ struct sparse_layout_t {
 
   }
   
-  //////////////////////////////////////////////////////////////////////////////
-  /// Extract the rows for a certain column
-  //////////////////////////////////////////////////////////////////////////////
-  template<typename T>
-  void rows(
-      int_t col,
-      std::vector<char> & active,
-      std::vector<T> & entries,
-      int_t n = -1) const
-  {
-    entries.clear();
-    
-    auto tot_cols = active.size() / num_rows;
-
-    size_t num = n<0 ? num_rows : std::min<size_t>(n, num_rows);
-    
-    //----------------------------------
-    // Dense
-    if (type == sparse_layout_type_t::dense) {
-      if (col<static_cast<int_t>(num_columns)) {
-        for (size_t i=0; i<num; ++i)
-          if (active[i*tot_cols + col])
-            entries.emplace_back(i*num_columns + col);
-      }
-    }
-    //----------------------------------
-    // itpack
-    else if (type == sparse_layout_type_t::itpack) {
-      for (size_t i=0; i<num; ++i) {
-        auto start = bandwidth*i;
-        auto end = start + row_counts[i];
-        for (auto j=start; j<end; ++j) {
-          if (col_ids[j] == col)
-            if (active[i*tot_cols + col])
-              entries.emplace_back(j);
-        }
-      }
-    }
-    //----------------------------------
-    // crs
-    else if (type == sparse_layout_type_t::crs) {
-      for (size_t i=0; i<num; ++i) {
-        auto start = row_offsets[i];
-        auto end = start + row_counts[i];
-        for (auto j=start; j<end; ++j) {
-          if (col_ids[j] == col)
-            if (active[i*tot_cols + col])
-              entries.emplace_back(j);
-        }
-      }
-    }
-
-  }
-  
-  //////////////////////////////////////////////////////////////////////////////
+  //============================================================================
   /// Shuffle 
-  //////////////////////////////////////////////////////////////////////////////
+  //============================================================================
   template<typename T>
   void shuffle(
       const std::vector<char> & active,
@@ -361,13 +496,13 @@ struct sparse_layout_t {
   {
 
     auto nnz = nonzeros.size();
-    int_t tot_cols = active.size() / num_rows;
+    size_t tot_cols = active.size() / num_rows;
 
     //----------------------------------
     // itpack
     if (type == sparse_layout_type_t::itpack) {
 
-      int_t nvals = nnz / (num_rows*bandwidth);
+      size_t nvals = nnz / (num_rows*bandwidth);
 
       std::vector<T> row(tot_cols * nvals);
           
@@ -380,15 +515,15 @@ struct sparse_layout_t {
 
         for (auto j=start; j<end && col_ids[j]!=-1; ++j) {
           auto colpos = col_ids[j];
-          for (int_t k=0; k<nvals; ++k)
+          for (size_t k=0; k<nvals; ++k)
             row[colpos*nvals + k] = nonzeros[j*nvals + k];
         }
 
         // copy into their new location
-        for (int_t j=0, cnt=0; j<tot_cols; ++j) {
+        for (size_t j=0, cnt=0; j<tot_cols; ++j) {
           if (active[i*tot_cols + j]) {
             auto pos = start + cnt;
-            for (int_t k=0; k<nvals; ++k)
+            for (size_t k=0; k<nvals; ++k)
               nonzeros[pos*nvals + k] = row[j*nvals + k];
             cnt++;
           }
@@ -401,7 +536,7 @@ struct sparse_layout_t {
     // crs
     else if (type == sparse_layout_type_t::crs) {
       
-      int_t nvals = nnz / row_offsets[num_rows];
+      size_t nvals = nnz / row_offsets[num_rows];
       
       std::vector<T> row(tot_cols * nvals);
       
@@ -415,15 +550,15 @@ struct sparse_layout_t {
 
         for (auto j=start; j<end && col_ids[j]!=-1; ++j) {
           auto colpos = col_ids[j];
-          for (int_t k=0; k<nvals; ++k)
+          for (size_t k=0; k<nvals; ++k)
             row[colpos*nvals + k] = nonzeros[j*nvals + k];
         }
 
         // copy into their new location
-        for (int_t j=0, cnt=0; j<tot_cols; ++j) {
+        for (size_t j=0, cnt=0; j<tot_cols; ++j) {
           if (active[i*tot_cols + j]) {
             auto pos = start + cnt;
-            for (int_t k=0; k<nvals; ++k)
+            for (size_t k=0; k<nvals; ++k)
               nonzeros[pos*nvals + k] = row[j*nvals + k];
             cnt++;
           }

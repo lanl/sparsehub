@@ -1,6 +1,7 @@
 #include "config.hpp"
 
 #include "crs.hpp"
+#include "sparse_layout.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <locale>
 #include <map>
@@ -22,27 +24,11 @@
 #include <fenv.h>
 #endif
 
-#include <exodusII.h>
-
-using ex_index_t = int64_t;
+using index_t = uint64_t;
+using layout_t = sparse_layout_t<index_t, int>;
 
 constexpr auto epsilon = std::numeric_limits<double>::epsilon();
 constexpr auto digits = std::numeric_limits<double>::digits10;
-
-// linear advection params
-constexpr double alpha = 1;
-constexpr double coef[] = {0.5, 0.5, 0};
-constexpr double mult[] = {1.0, 1.0, 0.0};
-constexpr double center[] = {2.0, 2.0, 0.0};
-
-constexpr double final_time = 10.0;
-constexpr double initial_deltat = 1.e-6;
-constexpr double cfl = 1;
-
-constexpr int max_iters = 100;
-constexpr int output_freq = 1;
-
-const std::string prefix = "out";
 
 constexpr int sigfigs = digits;
 constexpr int width = digits + 7;
@@ -53,6 +39,35 @@ constexpr int width = digits + 7;
 struct solution_t {
   double coef[3] = {0, 0, 0};
   double val = 0;
+
+  solution_t & operator=(const solution_t & other)
+  {
+    if (this != &other) {
+      val = other.val;
+      coef[0] = other.coef[0];
+      coef[1] = other.coef[1];
+      coef[2] = other.coef[2];
+    }
+    return *this;
+  }
+
+  static void zero(const solution_t & in, solution_t & out)
+  {
+    out.coef[0] = in.coef[0];
+    out.coef[1] = in.coef[1];
+    out.coef[2] = in.coef[2];
+    out.val = 0;
+  }
+
+};
+
+////////////////////////////////////////////////////////////////////////////////
+/// Boundary struct
+////////////////////////////////////////////////////////////////////////////////
+struct boundary_t {
+  index_t id;
+  index_t ghost;
+  boundary_t(index_t fid, index_t g) : id(fid), ghost(g) {}
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -303,7 +318,7 @@ void hex_geometry(
 /// Compute the cell geometry
 ////////////////////////////////////////////////////////////////////////////////
 void cell_geometry(
-    const ex_index_t * vs,
+    const index_t * vs,
     const double * vx,
     double * xc,
     double & v)
@@ -360,7 +375,7 @@ void cell_geometry(
 /// Compute the face geometry
 ////////////////////////////////////////////////////////////////////////////////
 void face_geometry(
-    const ex_index_t * vs,
+    const index_t * vs,
     const double * vx,
     double * x,
     double * n,
@@ -431,7 +446,7 @@ transpose(const crs_t<T, U> & in, crs_t<T, U> & out) {
 void output_vtk(
     const char * prefix,
     const std::vector<double> & node_coords,
-    const crs_t<ex_index_t, ex_index_t> & cell2vertices,
+    const crs_t<index_t, index_t> & cell2vertices,
     const std::vector<solution_t> & cell_solution)
 {
   std::string filename(prefix);
@@ -534,8 +549,9 @@ void output_csv(
 double time_step(
     size_t ndims,
     size_t ncells,
-    const ex_index_t * c2f_offsets,
-    const ex_index_t * c2f_indices,
+    const layout_t & layout,
+    const index_t * c2f_offsets,
+    const index_t * c2f_indices,
     const double * face_areas,
     const double * face_normals,
     const double * cell_volumes,
@@ -547,20 +563,27 @@ double time_step(
     auto start = c2f_offsets[c];
     auto end = c2f_offsets[c+1];
 
+    auto my_mats = layout.row_size(c);
+
     for (auto i=start; i<end; ++i) {
       auto f = c2f_indices[i];
 
       const auto n = &face_normals[f*ndims];
-      const auto a = &cell_solution[c].coef[0];
 
-      double dot = 0;
-      for (size_t d=0; d<ndims; ++d)
-        dot += n[d] * a[d];
+      for (int m=0; m<my_mats; ++m) {
+        auto matpos = layout(c, m);
+        
+        const auto a = &cell_solution[matpos].coef[0];
 
-      auto dx = cell_volumes[c] / face_areas[f];
-      auto dtc = dot / dx;
+        double dot = 0;
+        for (size_t d=0; d<ndims; ++d)
+          dot += n[d] * a[d];
 
-      dt = std::max(dt, dtc);
+        auto dx = cell_volumes[c] / face_areas[f];
+        auto dtc = dot / dx;
+
+        dt = std::max(dt, dtc);
+      }
     }
   }
 
@@ -590,23 +613,65 @@ double flux(
   return u*dot;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+/// Materiall flux
+////////////////////////////////////////////////////////////////////////////////
+double material_flux(
+    int m,
+    size_t ndims,
+    const layout_t & layout,
+    const index_t ileft,
+    const index_t iright,
+    const solution_t * cell_solution,
+    const double * n,
+    solution_t & ul,
+    solution_t & ur,
+    bool & exists)
+{
+
+  auto ml = layout.find_column(ileft,  m);
+  auto mr = layout.find_column(iright, m);
+
+  bool has_left = ml!=-1;
+  bool has_right = mr!=-1;
+  exists = (has_left || has_right);
+  if (!exists) return 0;
+
+  if (has_right) {
+    auto posr = layout(iright, mr);
+    ur = cell_solution[posr];
+    if (has_left) solution_t::zero(ur, ul);
+  }
+
+  if (has_left) {
+    auto posl = layout(ileft, ml);
+    ul = cell_solution[posl];
+    if (has_right) solution_t::zero(ul, ur);
+  }
+
+  return flux(ul, ur, n, ndims);
+}
     
 ////////////////////////////////////////////////////////////////////////////////
 /// Compute residual
 ////////////////////////////////////////////////////////////////////////////////
 void residual(
     size_t ndims,
+    size_t num_mats,
     size_t nfaces,
     size_t nbnd,
-    const ex_index_t * f2c_offsets,
-    const ex_index_t * f2c_indices,
-    const ex_index_t * bnd_faces,
+    const layout_t & layout,
+    const index_t * f2c_offsets,
+    const index_t * f2c_indices,
+    const boundary_t * bnd_faces,
     const double * face_normals,
     const double * face_areas,
     const solution_t * cell_solution,
-    const solution_t * bnd_solution,
     double * cell_residual)
 {
+
+  solution_t ul, ur;
+  bool exists;
 
   for (size_t f=0; f<nfaces; ++f) {
     auto start = f2c_offsets[f];
@@ -616,36 +681,50 @@ void residual(
     if (nc == 2) {
       auto ileft = f2c_indices[start];
       auto iright = f2c_indices[start+1];
-
-      const auto & ul = cell_solution[ileft];
-      const auto & ur = cell_solution[iright];
-
+        
       const auto n = &face_normals[f*ndims];
       const auto a = face_areas[f];
 
-      auto flx = flux(ul, ur, n, ndims);
-      
-      cell_residual[ileft]  -= flx*a;
-      cell_residual[iright] += flx*a;
+      for (size_t m=0; m<num_mats; ++m) {
+
+        auto flx = material_flux(
+            m, ndims, layout,
+            ileft, iright,
+            cell_solution, n,
+            ul, ur,
+            exists);
+        
+        if (exists) {
+          cell_residual[ileft *num_mats + m] -= flx*a;
+          cell_residual[iright*num_mats + m] += flx*a;
+        }
+
+      } // mats
+
     }
 
-  }
+  } // faces
   
   for (size_t bnd=0; bnd<nbnd; ++bnd) {
-    auto f = bnd_faces[bnd];
-    auto start = f2c_offsets[f];
+    const auto & f = bnd_faces[bnd];
+    auto start = f2c_offsets[f.id];
     auto ileft = f2c_indices[start];
 
-    const auto & ul = cell_solution[ileft];
-    const auto & ur = bnd_solution[bnd];
+    const auto n = &face_normals[f.id*ndims];
+    const auto a = face_areas[f.id];
 
-    const auto n = &face_normals[f*ndims];
-    const auto a = face_areas[f];
-
-    auto flx = flux(ul, ur, n, ndims);
+    for (size_t m=0; m<num_mats; ++m) {
+      auto flx = material_flux(
+          m, ndims, layout,
+          ileft, f.ghost,
+          cell_solution, n,
+          ul, ur,
+          exists);
+      if (exists)
+        cell_residual[ileft *num_mats + m] -= flx*a;
+    } // mat
       
-    cell_residual[ileft]  -= flx*a;
-  }
+  } // bnd
 }
    
 
@@ -654,15 +733,248 @@ void residual(
 ////////////////////////////////////////////////////////////////////////////////
 void update(
     size_t ncells,
+    size_t nmats,
     double dt,
+    const layout_t & layout,
     const double * cell_volumes,
-    const double * cell_residual,
-    solution_t * cell_solution)
+    const solution_t * cell_solution,
+    double * cell_residual)
 {
   for (size_t c=0; c<ncells; ++c) {
     auto fact = dt / cell_volumes[c];
-    cell_solution[c].val += fact * cell_residual[c];
+    
+    for (size_t m=0; m<nmats; ++m)
+      cell_residual[c*nmats+m] *= fact;
+
+    auto my_mats = layout.row_size(c);
+
+    for (int m=0; m<my_mats; ++m) {
+      auto mat = layout.column(c, m);
+      auto matpos = layout(c,m);
+      cell_residual[c*nmats+mat] += cell_solution[matpos].val;
+    }
+
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Set the solution
+////////////////////////////////////////////////////////////////////////////////
+void to_sparse(
+    size_t ncells,
+    size_t nmats,
+    const layout_t & layout,
+    const double * dense,
+    solution_t * sparse)
+{
+  for (size_t c=0; c<ncells; ++c) {
+
+    auto my_mats = layout.row_size(c);
+    auto start = layout(c,0);
+    for (int m=0; m<my_mats; ++m) {
+      auto mat = layout.column(c, m);
+      auto matpos = c*nmats + mat;
+      sparse[start+m].val = dense[matpos];
+    }
+
+  } // cells
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Set the solution
+////////////////////////////////////////////////////////////////////////////////
+void to_dense(
+    size_t ncells,
+    size_t nmats,
+    const layout_t & layout,
+    const solution_t * sparse,
+    double * dense)
+{
+  for (size_t c=0; c<ncells; ++c) {
+
+    auto my_mats = layout.row_size(c);
+    auto start = layout(c,0);
+    for (int m=0; m<my_mats; ++m) {
+      auto mat = layout.column(c, m);
+      auto matpos = c*nmats + mat;
+      dense[matpos] = sparse[start+m].val;
+    }
+
+  } // cells
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Count materials
+////////////////////////////////////////////////////////////////////////////////
+void count_materials(
+    size_t ncells,
+    size_t nmats,
+    double tol,
+    const double * cell_residual,
+    char * mat_active,
+    int * cell_num_mats,
+    int & max_bandwidth)
+{
+  max_bandwidth = 0;
+
+  for (size_t c=0; c<ncells; ++c) {
+
+    cell_num_mats[c] = 0;
+    for (size_t m=0; m<nmats; ++m) {
+      auto matpos = c*nmats+m;
+      mat_active[matpos] = cell_residual[matpos] > tol;
+      cell_num_mats[c] += mat_active[matpos];
+    }
+
+    max_bandwidth = std::max( cell_num_mats[c], max_bandwidth );
+
+  }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+/// Is this a number
+////////////////////////////////////////////////////////////////////////////////
+bool is_number(const std::string& str)
+{
+  for (char const &c : str)
+    if (std::isdigit(c) == 0) return false;
+  return true;
+}
+
+void check_number(const std::string & str) {
+  if (!is_number(str)) {
+    std::cout << "Value '" << str << "' is not representable ";
+    std::cout << " as a number." << std::endl;
+    abort();
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Parse input file
+////////////////////////////////////////////////////////////////////////////////
+int parse_input_file(
+    const char * filename,
+    std::map<std::string, std::string> & input)
+{
+  std::ifstream file(filename);
+ 
+  while (!file.eof()) {
+    std::string key, value, sep;
+    file >> key;
+    file >> sep;
+    file >> value;
+    input[key] = value;
+  }
+
+  return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//! \brief split a string using a list of delimeters
+//! \param [in] str  the input string
+//! \param [in] delim  the list of delimeters
+//! \return the list of split strings
+////////////////////////////////////////////////////////////////////////////////
+std::vector<std::string> split(
+  const std::string & str, 
+  std::vector<char> delim)
+{
+
+  if (str.empty()) return {};
+
+  struct tokens_t : std::ctype<char>
+  {
+    using ctype_base = std::ctype_base;
+    using cctype = std::ctype<char>;
+    using ccmask = cctype::mask;
+    
+    tokens_t(const std::vector<char> & delims) 
+      : cctype(get_table(delims)) {}
+
+    static ctype_base::mask const * get_table(
+      const std::vector<char> & delims
+    ) {
+      static const ccmask * const_rc = cctype::classic_table();
+      static ccmask rc[cctype::table_size];
+      std::memcpy(rc, const_rc, cctype::table_size*sizeof(ccmask));
+      for (const auto & d : delims) 
+        rc[static_cast<int>(d)] = ctype_base::space;
+      return &rc[0];
+    }
+  };
+
+  std::stringstream ss(str);
+  ss.imbue(std::locale(std::locale(), new tokens_t(delim)));
+  std::istream_iterator<std::string> begin(ss);
+  std::istream_iterator<std::string> end;
+  std::vector<std::string> vstrings(begin, end);
+  return vstrings;
+}
+  
+////////////////////////////////////////////////////////////////////////////////
+/// Get input
+////////////////////////////////////////////////////////////////////////////////
+template<typename T>
+T to_val(const std::string & str);
+
+template<>
+double to_val<double>(const std::string & str)
+{
+  check_number(str);
+  return atof(str.c_str());
+}
+
+template<>
+int to_val<int>(const std::string & str)
+{
+  check_number(str);
+  return atoi(str.c_str());
+}
+
+template<>
+size_t to_val<size_t>(const std::string & str)
+{
+  check_number(str);
+  return atoll(str.c_str());
+}
+
+template<>
+std::string to_val<std::string>(const std::string & str)
+{ return str; }
+
+template<typename T>
+T as_scalar(
+    std::map<std::string, std::string> & map,
+    const std::string & key,
+    const T & defval)
+{
+  bool exists = map.count(key);
+  auto res = exists ? to_val<T>(map.at(key)) : defval;
+  std::cout << "'" << key << "' = " << res << (exists?"":" (default)") << std::endl;
+  return res;
+}
+
+template<typename T>
+std::vector<T> as_vector(
+    std::map<std::string, std::string> & map,
+    const std::string & key,
+    const std::vector<T> & defval)
+{
+  std::vector<T> tmp = defval;
+  bool exists = map.count(key);
+
+  if (exists) {
+    auto toks = split(map.at(key), {','});
+    for (size_t t=0; t<std::min(toks.size(), defval.size()); ++t) 
+      tmp[t] = to_val<T>(toks[t]);
+  }
+
+  std::cout << "'" << key << "' = [ ";
+  for (const auto & i : tmp) std::cout << i << " ";
+  std::cout << "]" << (exists?"":" (default)") << std::endl;
+
+  return tmp;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -678,8 +990,7 @@ int main(int argc, char ** argv) {
   // Read command line arguments
   //============================================================================
   
-  std::string meshfile;
-  int layout;
+  int layout = 0;
 
   opterr = 0;
 
@@ -722,87 +1033,125 @@ int main(int argc, char ** argv) {
     }
   }
 
-  if (optind == argc) { 
-    std::cout << "No positional argument specified." << std::endl;
-    print_usage();
-    return 1;
-  }
-  else if (argc - optind > 1) { 
+  if (argc - optind > 1) { 
     std::cout << "Only one positional argument allowed." << std::endl;
     print_usage();
     return 1;
   }
 
-  meshfile = argv[optind];
+  std::string inputfile;
+  if (argc - optind==1) inputfile = argv[optind];
   
   //============================================================================
-  // Read mesh file
+  // Read input file
   //============================================================================
+  
+  std::map<std::string, std::string> input_map;
 
-  std::cout << "Reading mesh file '" << meshfile << "'" << std::endl;
+  if (!inputfile.empty()) {
 
-  if(!file_exists(meshfile.c_str())) {
-    std::cout << "File does not exist." << std::endl;
-    return 1;
+    std::cout << "Reading input file '" << inputfile << "'" << std::endl;
+  
+    if(!file_exists(inputfile.c_str())) {
+      std::cout << "File '" << inputfile << "'does not exist." << std::endl;
+      return 1;
+    }
+  
+    parse_input_file(inputfile.c_str(), input_map);
+
+    std::cout << std::endl;
+
   }
 
-  // size of floating point variables used in app.
-  int app_word_size = sizeof(double);
-
-  // size of floating point stored in name.
-  int exo_word_size = 0;
-  // the version number
-  float version;
-
-  // open the file
-  auto exoid = ex_open(meshfile.c_str(), EX_READ, &app_word_size, &exo_word_size, &version);
+  // mesh params
+  std::cout << "Mesh params:" << std::endl;
+  auto dims = as_vector<size_t>(input_map, "dims", {100, 100, 1});
+  auto lower = as_vector<double>(input_map, "lower", {0., 0., 0.});
+  auto upper = as_vector<double>(input_map, "upper", {10., 10., 1.});
   
-  //This sets the file to read IDs as 64 bit.  If the file does not have 
-  //64 bit IDs, it should have no effect. 
-  ex_set_int64_status(exoid, EX_ALL_INT64_API);
+  // linear advection params
+  std::cout << std::endl << "Problem params:" << std::endl;
+  auto alpha = as_scalar<double>(input_map, "alpha", 1.0);
+  auto coef = as_vector<double>(input_map, "coef", {0.5, 0.5, 0});
+  auto mult = as_vector<double>(input_map, "mult", {1.0, 1.0, 0.0});
+  auto center = as_vector<double>(input_map, "center", {2.0, 2.0, 0.0});
+  
+  std::cout << std::endl << "Solver params:" << std::endl;
+  auto final_time = as_scalar<double>(input_map, "time", 10.0);
+  auto initial_deltat = as_scalar<double>(input_map, "dt", 1.e-6);
+  auto cfl = as_scalar<double>(input_map, "cfl", 0.5);
+  
+  auto max_iters = as_scalar<size_t>(input_map, "iterations", 100);
+  auto output_freq = as_scalar<int>(input_map, "output_freq", 1);
+
+  auto num_stages = as_scalar<int>(input_map, "stages", 2);
+  
+  auto prefix = as_scalar<std::string>(input_map, "prefix", "out");
+
+  auto num_mats = as_scalar<int>(input_map, "materials", 2);
+  auto tol = as_scalar<double>(input_map, "tolerance", 1e-6);
+
+  auto sparse_layout = layout_t(layout);
+  
+
+  std::cout << std::endl;
 
   //----------------------------------------------------------------------------
-  // Read vertices
-  ex_init_params params;
-  ex_get_init_ext(exoid, &params);
+  // Create mesh
+  
+  //------------------------------------
+  // Mesh stats
 
-  auto num_dims = params.num_dim;
-  auto num_nodes = params.num_nodes;
-  auto num_blocks = params.num_elem_blk;
-
+  auto num_dims = dims.size();
   if (num_dims != 3) {
     std::cout << "Only 3d meshes are supported." << std::endl;
     return 1;
   }
+  
+  std::vector<double> delta(num_dims);
+  for ( size_t i=0; i<num_dims; ++i ) {
+    if ( upper[i] < lower[i] ) {
+      std::cout
+        << "Bounding box is invalid: for i=" << i << ", " << lower[i]
+        << " should be less than " << upper[i]
+        << std::endl;
+      return 1;
+    }
+    delta[i] =  (upper[i] - lower[i]) / dims[i];
+  }
+  
+  size_t num_nodes = 1;
+  size_t num_cells = 1;
+  size_t num_nodes_per_cell = 1;
 
+  for ( size_t i=0; i<num_dims; ++i ) {
+    num_nodes *= dims[i]+1;
+    num_cells *= dims[i];
+    num_nodes_per_cell *= 2;
+  }
+  
+  std::cout << "Creating mesh:" << std::endl;
+  std::cout << "  " << num_nodes << " vertices." << std::endl;
+  std::cout << "  " << num_cells << " cells." << std::endl;
+  
+  
+  //------------------------------------
+  // Build cells
+  
   std::vector<double> node_coords(num_nodes*num_dims);
-  ex_get_coord(
-      exoid, 
-      &node_coords[0],
-      &node_coords[num_nodes],
-      &node_coords[2*num_nodes]);
-
-  // transpose the vertices
-  column2row_major(&node_coords[0], num_nodes, num_dims);
-
-  //----------------------------------------------------------------------------
-  // Read blocks
-      
-  std::vector<ex_index_t> block_ids(num_blocks);
-  ex_get_ids(exoid, EX_ELEM_BLOCK, block_ids.data());
-    
-  crs_t<ex_index_t, ex_index_t> cell2verts;
+  
+  crs_t<index_t, index_t> cell2verts;
   cell2verts.offsets.emplace_back(0);
   
-  crs_t<ex_index_t, ex_index_t> cell2faces;
+  crs_t<index_t, index_t> cell2faces;
 
-  std::map<std::vector<ex_index_t>, ex_index_t> sorted_verts2faces;
-  crs_t<ex_index_t, ex_index_t> face2verts;
-  std::vector<ex_index_t> face_owner;
+  std::map<std::vector<index_t>, index_t> sorted_verts2faces;
+  crs_t<index_t, index_t> face2verts;
+  std::vector<index_t> face_owner;
 
   auto add_face = [&](const auto & vs, auto cid)
   {
-    std::vector<ex_index_t> sorted_vs(vs.begin(), vs.end());
+    std::vector<index_t> sorted_vs(vs.begin(), vs.end());
     std::sort(sorted_vs.begin(), sorted_vs.end());
     auto res = sorted_verts2faces.emplace(sorted_vs, sorted_verts2faces.size());
     auto fid = res.first->second;
@@ -812,73 +1161,67 @@ int main(int argc, char ** argv) {
     }
     return fid;
   };
-
-  size_t num_cells = 0;
-    
-  for (int b=0; b<num_blocks; ++b) {
-    auto block_id = block_ids[b];
   
-    //----------------------------------
-    // read block
-
-    // params
-    ex_block block_params;
-    block_params.id = block_id;
-    block_params.type = EX_ELEM_BLOCK;
-    ex_get_block_param(exoid, &block_params);
-
-    auto num_nodes_per_elem = block_params.num_nodes_per_entry;
-    auto num_elem = block_params.num_entry;
-          
-    if (!(strncmp("hex", block_params.topology, 3) == 0 ||
-          strncmp("HEX", block_params.topology, 3) == 0))
-    {
-      std::cout << "Only support hexes!." << std::endl;
-      return 1;
+  auto vertex_id = [&](auto i, auto j, auto k) {
+    return i + (dims[0]+1)*(j + (dims[1]+1)*k);
+  };
+  auto cell_id = [&](auto i, auto j, auto k) {
+    return i + dims[0]*(j + dims[1]*k);
+  };
+  
+  for ( size_t k=0; k<dims[2]+1; ++k ) {
+    for ( size_t j=0; j<dims[1]+1; ++j ) {
+      for ( size_t i=0; i<dims[0]+1; ++i ) {
+        auto id = vertex_id(i, j, k);
+        node_coords[id*num_dims+0] = lower[0] + i*delta[0];
+        node_coords[id*num_dims+1] = lower[1] + j*delta[1];
+        node_coords[id*num_dims+2] = lower[2] + k*delta[2];
+      }
     }
-  
-    // get block data
-    auto & indices = cell2verts.indices;
-    auto & offsets = cell2verts.offsets;
+  }
 
-    auto start = indices.size();
-    auto end = start + num_nodes_per_elem*num_elem;
-    indices.resize(end);
-    ex_get_conn(exoid, EX_ELEM_BLOCK, block_id, &indices[start], nullptr, nullptr);
-  
-    // convert indices to 0-based
-    for (auto i=start; i<end; ++i) indices[i]--;
+  std::vector<boundary_t> bnd_faces;
 
-    // compute offsets
-    start = offsets.size();
-    end = start + num_elem;
-    offsets.resize(end);
-    for (auto i=start; i<end; ++i)
-      offsets[i] = offsets[i-1] + num_nodes_per_elem;
+  for ( size_t k=0; k<dims[2]; ++k ) {
+    for ( size_t j=0; j<dims[1]; ++j ) {
+      for ( size_t i=0; i<dims[0]; ++i ) {
 
-    //----------------------------------
-    // Loop over cells
+        index_t vs[8];
+        vs[0] = vertex_id(i  ,   j, k  );
+        vs[1] = vertex_id(i+1,   j, k  );
+        vs[2] = vertex_id(i+1, j+1, k  );
+        vs[3] = vertex_id(i  , j+1, k  );
+        vs[4] = vertex_id(i  ,   j, k+1);
+        vs[5] = vertex_id(i+1,   j, k+1);
+        vs[6] = vertex_id(i+1, j+1, k+1);
+        vs[7] = vertex_id(i  , j+1, k+1);
+        cell2verts.push_back(&vs[0], &vs[8]);
+      
+        index_t fs[6];
+        fs[0] = add_face( std::vector<index_t>{vs[0], vs[1], vs[5], vs[4]}, c );
+        fs[1] = add_face( std::vector<index_t>{vs[1], vs[2], vs[6], vs[5]}, c );
+        fs[2] = add_face( std::vector<index_t>{vs[2], vs[3], vs[7], vs[6]}, c );
+        fs[3] = add_face( std::vector<index_t>{vs[3], vs[0], vs[4], vs[7]}, c );
+        fs[4] = add_face( std::vector<index_t>{vs[0], vs[3], vs[2], vs[1]}, c );
+        fs[5] = add_face( std::vector<index_t>{vs[4], vs[5], vs[6], vs[7]}, c );
+        cell2faces.push_back(&fs[0], &fs[6]);
 
-    auto cells_end = num_cells + num_elem;
-
-    for (auto c=num_cells; c<cells_end; ++c)
-    {
-      auto vs = cell2verts.at(c); 
-      ex_index_t fs[6];
-      fs[0] = add_face( std::vector<ex_index_t>{vs[0], vs[1], vs[5], vs[4]}, c );
-      fs[1] = add_face( std::vector<ex_index_t>{vs[1], vs[2], vs[6], vs[5]}, c );
-      fs[2] = add_face( std::vector<ex_index_t>{vs[2], vs[3], vs[7], vs[6]}, c );
-      fs[3] = add_face( std::vector<ex_index_t>{vs[3], vs[0], vs[4], vs[7]}, c );
-      fs[4] = add_face( std::vector<ex_index_t>{vs[0], vs[3], vs[2], vs[1]}, c );
-      fs[5] = add_face( std::vector<ex_index_t>{vs[4], vs[5], vs[6], vs[7]}, c );
-      cell2faces.push_back(&fs[0], &fs[6]);
+        if (i==0)
+          bnd_faces.emplace_back( fs[3], cell_id(dims[0]-1,j,k) );
+        if (i==dims[0]-1)
+          bnd_faces.emplace_back( fs[1], cell_id(0,j,k) );
+        if (j==0)
+          bnd_faces.emplace_back( fs[0], cell_id(i,dims[1]-1,k) );
+        if (j==dims[1]-1)
+          bnd_faces.emplace_back( fs[2], cell_id(i,0,k) );
+        if (k==0)
+          bnd_faces.emplace_back( fs[4], cell_id(i,j,dims[2]-1) );
+        if (k==dims[2]-1)
+          bnd_faces.emplace_back( fs[5], cell_id(i,j,0) );
+      }
     }
+  }
 
-    // increment cell counter
-    num_cells += num_elem;
-
-  } // blocks
-  
   //============================================================================
   // Compute cell quantities
   //============================================================================
@@ -905,14 +1248,12 @@ int main(int argc, char ** argv) {
 
   size_t num_faces = face2verts.size();
 
-  crs_t<ex_index_t, ex_index_t> face2cells;
+  crs_t<index_t, index_t> face2cells;
   transpose(cell2faces, face2cells);
   
   std::vector<double> face_centroids(num_faces*num_dims);
   std::vector<double> face_normals(num_faces*num_dims);
   std::vector<double> face_areas(num_faces);
-
-  std::vector<ex_index_t> bnd_faces;
 
   for (size_t f=0; f<num_faces; ++f) {
     auto vs = face2verts.at(f);
@@ -922,10 +1263,9 @@ int main(int argc, char ** argv) {
         &face_centroids[f*num_dims],
         &face_normals[f*num_dims],
         face_areas[f]);
-    auto cs = face2cells.at(f);
-    if (cs.size()==1) bnd_faces.emplace_back(f);
   }
-  
+
+
   auto num_bnd_faces = bnd_faces.size();
 
   //============================================================================
@@ -934,11 +1274,13 @@ int main(int argc, char ** argv) {
   
   std::cout << "Initialize solution." << std::endl;
 
-  std::vector<solution_t> cell_solution(num_cells);
-  std::vector<solution_t> bnd_face_solution(num_bnd_faces);
-  std::vector<double> cell_residual(num_cells);
+  std::vector<std::vector<int>> matids(num_cells);
+  std::vector<std::vector<solution_t>> initial_solution(num_cells);
 
-  auto ics = [](const auto x, auto & u) {
+  std::vector<int> cell_num_mats(num_cells, 0);
+  std::vector<char> cell_mat_active(num_cells*num_mats, 0);
+
+  auto ics = [&](const auto x, auto & u) {
     u.coef[0] = coef[0];
     u.coef[1] = coef[1];
     u.coef[2] = coef[2];
@@ -949,15 +1291,38 @@ int main(int argc, char ** argv) {
     u.val = exp( - fact * alpha );
   };
 
-  for (size_t c=0; c<num_cells; ++c)
-    ics(&cell_centroids[c*num_dims], cell_solution[c]);
+  for (int m=0; m<num_mats; ++m) {
 
-  for (size_t bnd=0; bnd<num_bnd_faces; ++bnd) {
-    auto f = bnd_faces[bnd];
-    ics(&face_centroids[f*num_dims], bnd_face_solution[bnd]);
-  }
-  std::cout << "done" << std::endl;
+    for (size_t c=0; c<num_cells; ++c) {
+      solution_t sol;
+      ics(&cell_centroids[c*num_dims], sol);
+      if (sol.val > tol) {
+        matids[c].emplace_back(m);
+        initial_solution[c].emplace_back(sol);
+        cell_num_mats[c]++;
+        cell_mat_active[c*num_mats+m] = 1;
+      }
+    }
+
+  } // mats
+
+  std::vector<index_t> mat_offsets;
+  std::vector<int> mat_counts;
+  std::vector<int> mat_indices;
+
+  sparse_layout.setup(
+      num_mats,
+      matids,
+      mat_offsets,
+      mat_counts,
+      mat_indices);
+
+  std::vector<solution_t> cell_solution;
+  sparse_layout.compress(matids, initial_solution,  cell_solution);
   
+
+  std::vector<double> cell_residual(num_mats*num_cells);
+
   size_t iter=0;
   double time=0;
 
@@ -995,6 +1360,7 @@ int main(int argc, char ** argv) {
       step_size = time_step(
           num_dims,
           num_cells,
+          sparse_layout,
           cell2faces.offsets.data(),
           cell2faces.indices.data(),
           face_areas.data(),
@@ -1006,50 +1372,90 @@ int main(int argc, char ** argv) {
 
     step_size = std::min( step_size, final_time - time);
 
-    std::fill(cell_residual.begin(), cell_residual.end(), 0);
+    auto stage_fact = static_cast<double>(1) / num_stages;
 
-    residual(
-        num_dims,
-        num_faces,
-        num_bnd_faces,
-        face2cells.offsets.data(),
-        face2cells.indices.data(),
-        bnd_faces.data(),
-        face_normals.data(),
-        face_areas.data(),
-        cell_solution.data(),
-        bnd_face_solution.data(),
-        cell_residual.data());
-    
-    update(
-        num_cells,
-        step_size,
-        cell_volumes.data(),
-        cell_residual.data(),
-        cell_solution.data());
+    for (int s=0; s<num_stages; ++s) {
 
-      iter++; 
-      time += step_size;
+      std::fill(cell_residual.begin(), cell_residual.end(), 0);
+
+      residual(
+          num_dims,
+          num_mats,
+          num_faces,
+          num_bnd_faces,
+          sparse_layout,
+          face2cells.offsets.data(),
+          face2cells.indices.data(),
+          bnd_faces.data(),
+          face_normals.data(),
+          face_areas.data(),
+          cell_solution.data(),
+          cell_residual.data());
       
-      auto tdelta = wall_time() - clock_start;
-      auto ss = std::cout.precision();
-      std::cout.setf( std::ios::scientific );
-      std::cout.precision(6);
-      std::cout << std::setw(8) << iter
-        << std::setw(17) << step_size
-        << std::setw(20) << time
-        << std::setw(20) << tdelta
-        << std::endl;
-      std::cout.unsetf( std::ios::scientific );
-      std::cout.precision(ss);
+      update(
+          num_cells,
+          num_mats,
+          stage_fact*step_size,
+          sparse_layout,
+          cell_volumes.data(),
+          cell_solution.data(),
+          cell_residual.data());
   
-    if (do_output && iter % output_freq == 0) {
-      std::stringstream ss;
-      ss << prefix << zero_padded(output_counter++);
-      std::cout << "Outputing: " << ss.str() << std::endl;
-      output_vtk(ss.str().c_str(), node_coords, cell2verts, cell_solution);
-      output_csv(ss.str().c_str(), cell_centroids, cell_solution);
-    }
+      int max_bandwidth = 0;
+      count_materials(
+          num_cells,
+          num_mats,
+          tol,
+          cell_residual.data(),
+          cell_mat_active.data(),
+          cell_num_mats.data(),
+          max_bandwidth);
+
+      if (sparse_layout.needs_resize(num_mats, max_bandwidth, cell_num_mats))
+        sparse_layout.resize(num_mats, max_bandwidth, cell_num_mats, cell_solution);
+  
+      sparse_layout.expand(
+          num_mats,
+          max_bandwidth,
+          cell_num_mats,
+          mat_offsets,
+          mat_counts,
+          mat_indices);
+  
+      sparse_layout.shuffle(cell_mat_active, cell_solution);
+      sparse_layout.reconfigure(cell_mat_active);
+
+      to_sparse(
+          num_cells,
+          num_mats,
+          sparse_layout,
+          cell_residual.data(),
+          cell_solution.data());
+
+    } // stages
+
+    iter++; 
+    time += step_size;
+    
+    auto tdelta = wall_time() - clock_start;
+    auto ss = std::cout.precision();
+    std::cout.setf( std::ios::scientific );
+    std::cout.precision(6);
+    std::cout << std::setw(8) << iter
+      << std::setw(17) << step_size
+      << std::setw(20) << time
+      << std::setw(20) << tdelta
+      << std::endl;
+    std::cout.unsetf( std::ios::scientific );
+    std::cout.precision(ss);
+  
+    //if (do_output && iter % output_freq == 0) {
+    //  std::stringstream ss;
+    //  ss << prefix << zero_padded(output_counter++);
+    //  std::cout << "Outputing: " << ss.str() << std::endl;
+    //  output_vtk(ss.str().c_str(), node_coords, cell2verts, cell_solution);
+    //  output_csv(ss.str().c_str(), cell_centroids, cell_solution);
+    //}
 
   }
 

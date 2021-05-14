@@ -29,30 +29,6 @@ add_executable( sparsehub )
 
 include(CTest) # note: this adds a BUILD_TESTING which defaults to ON
 
-#------------------------------------------------------------------------------#
-# Setup third party packages
-#------------------------------------------------------------------------------#
-
-find_package(EXODUSII QUIET)
-option(HAVE_EXODUS "Have the exodus library" ${EXODUSII_FOUND})
-if(HAVE_EXODUS)
-  target_include_directories(sparsehub PUBLIC ${EXODUSII_INCLUDE_DIRS})
-  target_link_libraries(sparsehub PUBLIC ${EXODUSII_LIBRARIES})
-endif()
-
-find_package(MPI COMPONENTS C CXX)
-if (MPI_FOUND)
-  target_link_libraries(sparsehub PUBLIC MPI::MPI_C MPI::MPI_CXX)
-endif()
-
-
-set(PARMETIS_TEST_RUNS TRUE)
-find_package(ParMETIS 4.0 QUIET)
-option(HAVE_PARMETIS "Have the parmetis library" ${PARMETIS_FOUND})
-if (HAVE_PARMETIS)
-  target_include_directories(sparsehub PUBLIC ${PARMETIS_INCLUDE_DIRS})
-  target_link_libraries(sparsehub PUBLIC ${PARMETIS_LIBRARIES})
-endif()
 
 #------------------------------------------------------------------------------#
 # configure library

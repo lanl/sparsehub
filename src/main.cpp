@@ -48,7 +48,7 @@ struct boundary_t {
 ////////////////////////////////////////////////////////////////////////////////
 void print_usage() {
   std::cout << std::endl;
-  std::cout << "help: sparsehub [-h] [-l LAYOUT] FILENAME" << std::endl;
+  std::cout << "help: sparsehub [-h] [-l LAYOUT] [FILENAME]" << std::endl;
   std::cout << std::endl;
   std::cout << "Sparsehub solves the advection equation using a sparse";
   std::cout << " matrix representation of the data." << std::endl;
@@ -60,7 +60,7 @@ void print_usage() {
     << std::endl; 
   std::cout << std::endl;
   std::cout << "Arguments:" << std::endl;
-  std::cout << " FILENAME \t The mesh file name.";
+  std::cout << " FILENAME \t The input file name.";
   std::cout << std::endl;
 }
 
@@ -79,18 +79,18 @@ double wall_time(void)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+/// Square of a number
+////////////////////////////////////////////////////////////////////////////////
+template<typename T>
+T sqr(T x) { return x*x; }
+
+////////////////////////////////////////////////////////////////////////////////
 /// Check if file exists
 ////////////////////////////////////////////////////////////////////////////////
 bool file_exists(const char * filename) {
   std::ifstream file(filename);
   return file.is_open();
 }
-
-////////////////////////////////////////////////////////////////////////////////
-/// Square of a number
-////////////////////////////////////////////////////////////////////////////////
-template<typename T>
-T sqr(T x) { return x*x; }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Tack on an iteration number to a string
@@ -420,7 +420,9 @@ void output_vtk(
     const char * prefix,
     const std::vector<double> & node_coords,
     const crs_t<index_t, index_t> & cell2vertices,
-    const std::vector<double> & cell_solution)
+    const std::vector<double> & cell_solution,
+    const std::vector<char> & mat_active,
+    size_t ncomp = 1)
 {
   std::string filename(prefix);
   filename += ".vtk";
@@ -430,7 +432,7 @@ void output_vtk(
   file.precision(sigfigs);
 
   auto nverts = node_coords.size() / 3;
-  auto ncells = cell_solution.size();
+  auto ncells = cell_solution.size() / ncomp;
 
   file << "# vtk DataFile Version 2.0" << std::endl;
   file << "Advection results" << std::endl;
@@ -459,11 +461,21 @@ void output_vtk(
   
   file << "CELL_DATA " << ncells << std::endl;
   
-  file << "SCALARS solution double 1" << std::endl;
-  file << "LOOKUP_TABLE default" << std::endl;
-  for (size_t c=0; c<ncells; ++c) 
-    file << cell_solution[c] << " ";
-  file << std::endl;
+  for (size_t i=0; i<ncomp; ++i) {
+    file << "SCALARS solution" << i << " double 1" << std::endl;
+    file << "LOOKUP_TABLE default" << std::endl;
+    for (size_t c=0; c<ncells; ++c) 
+      file << cell_solution[c*ncomp + i] << " ";
+    file << std::endl;
+  }
+  
+  for (size_t i=0; i<ncomp; ++i) {
+    file << "SCALARS active" << i << " int 1" << std::endl;
+    file << "LOOKUP_TABLE default" << std::endl;
+    for (size_t c=0; c<ncells; ++c) 
+      file << static_cast<int>(mat_active[c*ncomp + i]) << " ";
+    file << std::endl;
+  }
   
 }
 
@@ -473,7 +485,9 @@ void output_vtk(
 void output_csv(
     const char * prefix,
     const std::vector<double> & cell_centroids,
-    const std::vector<double> & cell_solution)
+    const std::vector<double> & cell_solution,
+    const std::vector<char> & mat_active,
+    size_t ncomp = 1)
 {
   std::string filename(prefix);
   filename += ".csv";
@@ -482,7 +496,7 @@ void output_csv(
   file.setf(std::ios::scientific);
   file.precision(sigfigs);
 
-  auto ncells = cell_solution.size();
+  auto ncells = cell_solution.size() / ncomp;
   auto ndims = cell_centroids.size() / ncells;
 
   for (size_t d=0; d<ndims; ++d) {
@@ -490,7 +504,10 @@ void output_csv(
     ss << "x" << d;
     file << std::setw(width) << ss.str() << ",";
   }
-  file << std::setw(width) << "solution" << std::endl; 
+  for (size_t i=0; i<ncomp; ++i) {
+    file << std::setw(width) << "active" << i << std::endl; 
+    file << std::setw(width) << "solution" << i << std::endl; 
+  }
 
   for (size_t c=0; c<ncells; ++c) {
     
@@ -499,8 +516,12 @@ void output_csv(
       file << std::setw(width) << x << ",";
     }
 
-    const auto & u = cell_solution[c];
-    file << std::setw(width) << u << std::endl;
+    const auto u = &cell_solution[c*ncomp];
+    const auto a = &mat_active[c*ncomp];
+    for (size_t i=0; i<ncomp; ++i) {
+      file << std::setw(width) << a[i] << std::endl;
+      file << std::setw(width) << u[i] << std::endl;
+    }
   }
 }
 
@@ -600,13 +621,13 @@ double material_flux(
   if (has_right) {
     auto posr = layout(iright, mr);
     ur = cell_solution[posr];
-    if (has_left) ul = 0;
+    if (!has_left) ul = 0;
   }
 
   if (has_left) {
     auto posl = layout(ileft, ml);
     ul = cell_solution[posl];
-    if (has_right) ur = 0;
+    if (!has_right) ur = 0;
   }
 
   return flux(ul, ur, &coef[m*ndims], n, ndims);
@@ -795,9 +816,10 @@ void count_materials(
 ////////////////////////////////////////////////////////////////////////////////
 bool is_number(const std::string& str)
 {
-  for (char const &c : str)
-    if (std::isdigit(c) == 0) return false;
-  return true;
+  std::istringstream iss(str);
+  float f;
+  iss >> std::noskipws >> f;
+  return iss.eof() && !iss.fail();
 }
 
 void check_number(const std::string & str) {
@@ -806,26 +828,6 @@ void check_number(const std::string & str) {
     std::cout << " as a number." << std::endl;
     abort();
   }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// Parse input file
-////////////////////////////////////////////////////////////////////////////////
-int parse_input_file(
-    const char * filename,
-    std::map<std::string, std::string> & input)
-{
-  std::ifstream file(filename);
- 
-  while (!file.eof()) {
-    std::string key, value, sep;
-    file >> key;
-    file >> sep;
-    file >> value;
-    input[key] = value;
-  }
-
-  return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -856,6 +858,7 @@ std::vector<std::string> split(
       static const ccmask * const_rc = cctype::classic_table();
       static ccmask rc[cctype::table_size];
       std::memcpy(rc, const_rc, cctype::table_size*sizeof(ccmask));
+      rc[static_cast<int>(' ')] = ';';
       for (const auto & d : delims) 
         rc[static_cast<int>(d)] = ctype_base::space;
       return &rc[0];
@@ -870,6 +873,54 @@ std::vector<std::string> split(
   return vstrings;
 }
   
+////////////////////////////////////////////////////////////////////////////////
+/// Strip characters from a string
+////////////////////////////////////////////////////////////////////////////////
+void lstrip(std::string & str, const std::string & delim = " ") 
+{ str.erase( 0, str.find_first_not_of(delim) ); }
+
+void rstrip(std::string & str, const std::string & delim = " ") 
+{ str.erase(str.find_last_not_of(delim)+1); }
+
+void strip(std::string & str)
+{
+  lstrip(str);
+  rstrip(str);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Parse input file
+////////////////////////////////////////////////////////////////////////////////
+int parse_input_file(
+    const char * filename,
+    std::map<std::string, std::string> & input)
+{
+  std::ifstream file(filename);
+
+  if (file.is_open()) {
+    std::string str;
+    while(getline(file, str)){
+      auto pos = str.find_first_of("#");
+      if (pos != std::string::npos) str.erase(pos);
+      auto toks = split(str, {'='});
+      if (toks.size() == 2) {
+        strip(toks[0]);
+        strip(toks[1]);
+        input[toks[0]] = toks[1];
+      }
+      else if (toks.size()) {
+        std::cout << "Impropery formatted line." << std::endl;
+        std::cout << ">> '" << str << "'" << std::endl;
+        return 1;
+      }
+    }
+    return 0;
+  }
+  else {
+    return 1;
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 /// Get input
 ////////////////////////////////////////////////////////////////////////////////
@@ -923,7 +974,7 @@ std::vector<T> as_vector(
   bool exists = map.count(key);
 
   if (exists) {
-    auto toks = split(map.at(key), {','});
+    auto toks = split(map.at(key), {',', ' '});
     for (size_t t=0; t<std::min(toks.size(), defval.size()); ++t) 
       tmp[t] = to_val<T>(toks[t]);
   }
@@ -934,6 +985,17 @@ std::vector<T> as_vector(
 
   return tmp;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+/// append to list
+////////////////////////////////////////////////////////////////////////////////
+template<typename T>
+void append(std::vector<T> & inout, const std::vector<T> & in)
+{ inout.insert(inout.end(), in.begin(), in.end()); }
+
+template<typename T>
+void append(std::vector<T> & inout, const T & in)
+{ inout.emplace_back(in); }
 
 ////////////////////////////////////////////////////////////////////////////////
 /// Main
@@ -1009,13 +1071,15 @@ int main(int argc, char ** argv) {
   if (!inputfile.empty()) {
 
     std::cout << "Reading input file '" << inputfile << "'" << std::endl;
-  
     if(!file_exists(inputfile.c_str())) {
       std::cout << "File '" << inputfile << "'does not exist." << std::endl;
       return 1;
     }
-  
-    parse_input_file(inputfile.c_str(), input_map);
+    
+    if (parse_input_file(inputfile.c_str(), input_map)) {
+      std::cout << "Trouble reading '" << inputfile << "'." << std::endl;
+      return 1;
+    }
 
     std::cout << std::endl;
 
@@ -1029,24 +1093,36 @@ int main(int argc, char ** argv) {
   
   // linear advection params
   std::cout << std::endl << "Problem params:" << std::endl;
-  auto alpha = as_scalar<double>(input_map, "alpha", 1.0);
-  auto coef = as_vector<double>(input_map, "coef", {0.5, 0.5, 0});
-  auto mult = as_vector<double>(input_map, "mult", {1.0, 1.0, 0.0});
-  auto center = as_vector<double>(input_map, "center", {2.0, 2.0, 0.0});
+  auto num_mats = as_scalar<int>(input_map, "materials", 1);
+  std::cout << std::endl;
+
+  std::vector<double> 
+    mat_advect_alpha,
+    mat_advect_coef,
+    mat_advect_mult,
+    mat_advect_center;
+
+  for (int m=0; m<num_mats; ++m) {
+    auto mstr = std::to_string(m);
+    append(mat_advect_alpha, as_scalar<double>(input_map, "alpha"+mstr, 1.0));
+    append(mat_advect_coef, as_vector<double>(input_map, "coef"+mstr, {0.5, 0.5, 0}));
+    append(mat_advect_mult, as_vector<double>(input_map, "mult"+mstr, {1.0, 1.0, 0.0}));
+    append(mat_advect_center, as_vector<double>(input_map, "center"+mstr, {2.0, 2.0, 0.0}));
+    std::cout << std::endl;
+  }
   
-  std::cout << std::endl << "Solver params:" << std::endl;
+  std::cout << "Solver params:" << std::endl;
   auto final_time = as_scalar<double>(input_map, "time", 10.0);
   auto initial_deltat = as_scalar<double>(input_map, "dt", 1.e-6);
   auto cfl = as_scalar<double>(input_map, "cfl", 0.5);
   
-  auto max_iters = as_scalar<size_t>(input_map, "iterations", 100);
+  auto max_iters = as_scalar<size_t>(input_map, "iterations", 1);
   auto output_freq = as_scalar<int>(input_map, "output_freq", 1);
 
   auto num_stages = as_scalar<int>(input_map, "stages", 2);
   
   auto prefix = as_scalar<std::string>(input_map, "prefix", "out");
 
-  auto num_mats = as_scalar<int>(input_map, "materials", 1);
   auto tol = as_scalar<double>(input_map, "tolerance", 1e-6);
 
   auto sparse_layout = layout_t(layout);
@@ -1240,9 +1316,11 @@ int main(int argc, char ** argv) {
 
   auto ics = [&](const auto m, const auto x, auto & u) {
     double fact = 0;
+    const auto mult = &mat_advect_mult[m*num_dims];
+    const auto center = &mat_advect_center[m*num_dims];
     for (size_t d=0; d<num_dims; ++d)
-      fact += mult[d]*sqr(x[d]-center[m*num_dims + d]);
-    u = exp( - fact * alpha );
+      fact += mult[d]*sqr(x[d]-center[d]);
+    u = exp( - fact * mat_advect_alpha[m] );
   };
 
   for (int m=0; m<num_mats; ++m) {
@@ -1290,7 +1368,7 @@ int main(int argc, char ** argv) {
       std::stringstream ss;
       ss << prefix << zero_padded(output_counter++);
       auto eff = static_cast<double>(cell_solution.size()) / (num_mats*num_cells);
-      std::cout << "Outputing: " << ss.str() << ", Efficiency=" << eff*100.;
+      std::cout << "Outputing: " << ss.str() << ", Efficiency=" << (1.-eff)*100.;
       std::cout << " %" <<  std::endl;
       std::vector<double> dense_solution(num_mats*num_cells, 0);
       to_dense(
@@ -1299,8 +1377,19 @@ int main(int argc, char ** argv) {
           sparse_layout,
           cell_solution.data(),
           dense_solution.data());
-      output_vtk(ss.str().c_str(), node_coords, cell2verts, dense_solution);
-      output_csv(ss.str().c_str(), cell_centroids, dense_solution);
+      output_vtk(
+          ss.str().c_str(),
+          node_coords,
+          cell2verts,
+          dense_solution,
+          cell_mat_active,
+          num_mats);
+      output_csv(
+          ss.str().c_str(),
+          cell_centroids,
+          dense_solution,
+          cell_mat_active,
+          num_mats);
     };
 
     do_output();
@@ -1335,7 +1424,7 @@ int main(int argc, char ** argv) {
           face_normals.data(),
           cell_volumes.data(),
           cell_solution.data(),
-          coef.data());
+          mat_advect_coef.data());
       step_size *= cfl;
     }
 
@@ -1358,7 +1447,7 @@ int main(int argc, char ** argv) {
           bnd_faces.data(),
           face_normals.data(),
           face_areas.data(),
-          coef.data(),
+          mat_advect_coef.data(),
           cell_solution.data(),
           cell_residual.data());
       
@@ -1381,7 +1470,7 @@ int main(int argc, char ** argv) {
           cell_num_mats.data(),
           max_bandwidth);
 
-      if (sparse_layout.needs_resize(num_mats, max_bandwidth, cell_num_mats))
+      if (sparse_layout.needs_resize(num_mats, max_bandwidth, cell_num_mats, true))
         sparse_layout.resize(num_mats, max_bandwidth, cell_num_mats, cell_solution);
   
       sparse_layout.expand(

@@ -1,0 +1,36 @@
+dims = 100, 100,1
+lower = 0, 0, 0
+upper = 10, 10, 1
+
+materials = 4
+
+# bottom left
+coef0 = 0.5, 0.5, 0
+mult0 = 4.0, 4.0, 0
+center0 = 2.0, 2.0, 0
+
+# bottom right
+coef1 = -0.5, 0.5, 0
+mult1 = 4.0, 4.0, 0
+center1 = 8.0, 2.0, 0
+
+# top right
+coef2 = -0.5, -0.5, 0
+mult2 = 4.0, 4.0, 0
+center2 = 8.0, 8.0, 0
+
+# top left
+coef3 = 0.5, -0.5, 0
+mult3 = 4.0, 4.0, 0
+center3 = 2.0, 8.0, 0
+
+tolerance = 1e-5
+
+time = 10
+stages = 2
+iterations = 100
+cfl = 0.5
+dt = 1e-12
+
+output_freq = 10
+prefix = out

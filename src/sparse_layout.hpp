@@ -340,7 +340,7 @@ struct sparse_layout_t {
         auto end = start + row_counts[i];
         for (auto j=start; j<end; ++j)
           if (ind == col_ids[j])
-            return j; 
+            return j-start; 
         return -1;
       }
       default:
